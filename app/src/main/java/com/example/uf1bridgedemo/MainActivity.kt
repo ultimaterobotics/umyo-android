@@ -74,6 +74,9 @@ class MainActivity : ComponentActivity() {
     private var gatt: BluetoothGatt? = null
     private var gattChar: BluetoothGattCharacteristic? = null
 
+    @Volatile private var gattServicesStarted = false
+    @Volatile private var gattGotFirstData = false
+
     private var gattMac: String = "00:00:00:00:00:00"
     private var gattDevId: UInt = 0u
     private var gattSeq: UInt = 0u
@@ -506,6 +509,9 @@ class MainActivity : ComponentActivity() {
                 gattCount = 0
                 gattWindowStartMs = SystemClock.elapsedRealtime()
 
+                gattServicesStarted = false
+                gattGotFirstData = false
+
                 updateStatus("GATT: connecting to $name $mac (rssi=$lastScanRssi)…")
 
                 gatt = result.device.connectGatt(
@@ -523,6 +529,9 @@ class MainActivity : ComponentActivity() {
                                     false
                                 }
 
+                                gattServicesStarted = false
+                                gattGotFirstData = false
+
                                 val mtuOk = try {
                                     g.requestMtu(64)
                                 } catch (_: Exception) {
@@ -531,9 +540,27 @@ class MainActivity : ComponentActivity() {
 
                                 if (!mtuOk) {
                                     updateStatus("GATT: connected, high-priority=$prioOk, mtu request failed, discovering services…")
-                                    g.discoverServices()
+                                    if (!gattServicesStarted) {
+                                        gattServicesStarted = true
+                                        g.discoverServices()
+                                    }
                                 } else {
                                     updateStatus("GATT: connected, high-priority=$prioOk, waiting for MTU…")
+
+                                    // Watchdog: some stacks never call onMtuChanged()
+                                    thread(start = true) {
+                                        Thread.sleep(1500)
+                                        if (runMode == RunMode.GATT && !gattServicesStarted && gatt === g) {
+                                            gattServicesStarted = true
+                                            runOnUiThread {
+                                                updateStatus("GATT: MTU callback timeout, discovering services anyway…")
+                                            }
+                                            try {
+                                                g.discoverServices()
+                                            } catch (_: Exception) {
+                                            }
+                                        }
+                                    }
                                 }
                             } else {
                                 updateStatus("GATT: disconnected (status=$status)")
@@ -580,7 +607,17 @@ class MainActivity : ComponentActivity() {
                         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
                             if (runMode != RunMode.GATT) return
                             if (status == BluetoothGatt.GATT_SUCCESS) {
+                                gattGotFirstData = false
                                 updateStatus("GATT: notifications enabled ✅ waiting for data…")
+
+                                thread(start = true) {
+                                    Thread.sleep(2000)
+                                    if (runMode == RunMode.GATT && !gattGotFirstData && gatt === g) {
+                                        runOnUiThread {
+                                            updateStatus("GATT: notifications enabled but no data after 2s")
+                                        }
+                                    }
+                                }
                             } else {
                                 updateStatus("GATT: CCCD write failed ($status)")
                             }
@@ -590,18 +627,24 @@ class MainActivity : ComponentActivity() {
                         override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
                             if (runMode != RunMode.GATT) return
                             val v = characteristic.value ?: return
+                            gattGotFirstData = true
                             handleGattNotify(v, hostIp, port, updateStatus)
-
                         }
                         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
                             if (runMode != RunMode.GATT) return
+                            if (gattServicesStarted) return
+
+                            gattServicesStarted = true
 
                             if (status == BluetoothGatt.GATT_SUCCESS) {
                                 updateStatus("GATT: mtu=$mtu status=$status, discovering services…")
-                                g.discoverServices()
                             } else {
                                 updateStatus("GATT: mtu change failed ($status), discovering services anyway…")
+                            }
+
+                            try {
                                 g.discoverServices()
+                            } catch (_: Exception) {
                             }
                         }
                     }
@@ -621,59 +664,118 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleGattNotify(v: ByteArray, hostIp: String, port: Int, updateStatus: (String) -> Unit) {
-        val rawPayload = (v.size == 20 || v.size == 36 || v.size == 52)
+        when (v.size) {
+            20, 36, 52 -> {
+                val tSrcBase = ByteBuffer.wrap(v, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int.toUInt()
+                val chunkCount = (v.size - 4) / 16
 
-        if (rawPayload) {
-            val tSrcBase = ByteBuffer.wrap(v, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int.toUInt()
-            val chunkCount = (v.size - 4) / 16
+                for (chunk in 0 until chunkCount) {
+                    val samples = ShortArray(8)
+                    val bb = ByteBuffer.wrap(v, 4 + chunk * 16, 16).order(ByteOrder.LITTLE_ENDIAN)
+                    for (i in 0 until 8) samples[i] = bb.short
 
-            for (chunk in 0 until chunkCount) {
-                val samples = ShortArray(8)
-                val bb = ByteBuffer.wrap(v, 4 + chunk * 16, 16).order(ByteOrder.LITTLE_ENDIAN)
-                for (i in 0 until 8) samples[i] = bb.short
+                    val tUs = (SystemClock.elapsedRealtimeNanos() / 1000L) and ((1L shl 48) - 1)
+                    val frame = uf1EncodeFrameStatusEmg(
+                        deviceId = gattDevId,
+                        seq = gattSeq,
+                        tUs = tUs,
+                        tSrcSample = tSrcBase + (chunk * 8).toUInt(),
+                        sampleRateHz = 1150,
+                        batteryPct = 255,
+                        rssiDbm = -128,
+                        mode = 0,
+                        statusFlags = 0,
+                        samples = samples
+                    )
+                    gattSeq++
+                    sendQueue?.offer(frame)
+                }
+            }
 
+            26 -> {
+                handleAux26(v)
+            }
+
+            60 -> {
+                val tSrcBase = ByteBuffer.wrap(v, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int.toUInt()
+
+                for (chunk in 0 until 3) {
+                    val samples = ShortArray(8)
+                    val bb = ByteBuffer.wrap(v, 4 + chunk * 16, 16).order(ByteOrder.LITTLE_ENDIAN)
+                    for (i in 0 until 8) samples[i] = bb.short
+
+                    val tUs = (SystemClock.elapsedRealtimeNanos() / 1000L) and ((1L shl 48) - 1)
+                    val frame = uf1EncodeFrameStatusEmg(
+                        deviceId = gattDevId,
+                        seq = gattSeq,
+                        tUs = tUs,
+                        tSrcSample = tSrcBase + (chunk * 8).toUInt(),
+                        sampleRateHz = 1150,
+                        batteryPct = 255,
+                        rssiDbm = -128,
+                        mode = 0,
+                        statusFlags = 0,
+                        samples = samples
+                    )
+                    gattSeq++
+                    sendQueue?.offer(frame)
+                }
+
+                val quatVal = v.copyOfRange(52, 60)
                 val tUs = (SystemClock.elapsedRealtimeNanos() / 1000L) and ((1L shl 48) - 1)
-                val frame = uf1EncodeFrameStatusEmg(
+
+                val statusVal = ByteBuffer.allocate(10)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .apply {
+                        putInt(0)
+                        putShort(0)
+                        put(255.toByte())
+                        put(lastScanRssi.toByte())
+                        put(0)
+                        put(0)
+                    }
+                    .array()
+
+                val frame = uf1EncodeFrameStatusPlusBlock(
                     deviceId = gattDevId,
                     seq = gattSeq,
                     tUs = tUs,
-                    tSrcSample = tSrcBase + (chunk * 8).toUInt(),
-                    sampleRateHz = 1150,
-                    batteryPct = 255,
-                    rssiDbm = -128,
-                    mode = 0,
-                    statusFlags = 0,
-                    samples = samples
+                    statusVal = statusVal,
+                    blockType = 0x05,    // QUAT
+                    blockVal = quatVal
                 )
+
                 gattSeq++
                 sendQueue?.offer(frame)
             }
-        } else {
-            val tUs = (SystemClock.elapsedRealtimeNanos() / 1000L) and ((1L shl 48) - 1)
 
-            val statusVal = ByteBuffer.allocate(10)
-                .order(ByteOrder.LITTLE_ENDIAN)
-                .apply {
-                    putInt(0)
-                    putShort(0)
-                    put(255.toByte())
-                    put(lastScanRssi.toByte())
-                    put(0)
-                    put(0)
-                }
-                .array()
+            else -> {
+                val tUs = (SystemClock.elapsedRealtimeNanos() / 1000L) and ((1L shl 48) - 1)
 
-            val frame = uf1EncodeFrameStatusPlusBlock(
-                deviceId = gattDevId,
-                seq = gattSeq,
-                tUs = tUs,
-                statusVal = statusVal,
-                blockType = 0xF1,
-                blockVal = v
-            )
+                val statusVal = ByteBuffer.allocate(10)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .apply {
+                        putInt(0)
+                        putShort(0)
+                        put(255.toByte())
+                        put(lastScanRssi.toByte())
+                        put(0)
+                        put(0)
+                    }
+                    .array()
 
-            gattSeq++
-            sendQueue?.offer(frame)
+                val frame = uf1EncodeFrameStatusPlusBlock(
+                    deviceId = gattDevId,
+                    seq = gattSeq,
+                    tUs = tUs,
+                    statusVal = statusVal,
+                    blockType = 0xF1,
+                    blockVal = v
+                )
+
+                gattSeq++
+                sendQueue?.offer(frame)
+            }
         }
 
         gattCount++
@@ -682,10 +784,61 @@ class MainActivity : ComponentActivity() {
             val fps = gattCount / ((nowMs - gattWindowStartMs) / 1000.0)
             gattCount = 0
             gattWindowStartMs = nowMs
-            updateStatus("GATT → $hostIp:$port  notify≈${"%.1f".format(fps)}  mac=$gattMac  len=${v.size}")
+            updateStatus("GATT → $hostIp:$port notify≈${"%.1f".format(fps)} mac=$gattMac len=${v.size}")
         }
     }
+    private fun handleAux26(v: ByteArray) {
+        val imuVal = v.copyOfRange(0, 12)
+        val magVal = v.copyOfRange(12, 18)
+        val quatVal = v.copyOfRange(18, 26)
 
+        val tUs = (SystemClock.elapsedRealtimeNanos() / 1000L) and ((1L shl 48) - 1)
+
+        val statusVal = ByteBuffer.allocate(10)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .apply {
+                putInt(0)                 // no t_src_sample for aux-only frame
+                putShort(0)               // sample_rate_hz unknown
+                put(255.toByte())         // battery unknown
+                put(lastScanRssi.toByte())
+                put(0)                    // mode = PhoneOpt
+                put(0)                    // status_flags
+            }
+            .array()
+
+        val imuFrame = uf1EncodeFrameStatusPlusBlock(
+            deviceId = gattDevId,
+            seq = gattSeq,
+            tUs = tUs,
+            statusVal = statusVal,
+            blockType = 0x03,            // IMU_6DOF
+            blockVal = imuVal
+        )
+        gattSeq++
+        sendQueue?.offer(imuFrame)
+
+        val magFrame = uf1EncodeFrameStatusPlusBlock(
+            deviceId = gattDevId,
+            seq = gattSeq,
+            tUs = tUs,
+            statusVal = statusVal,
+            blockType = 0x04,            // MAG_3
+            blockVal = magVal
+        )
+        gattSeq++
+        sendQueue?.offer(magFrame)
+
+        val quatFrame = uf1EncodeFrameStatusPlusBlock(
+            deviceId = gattDevId,
+            seq = gattSeq,
+            tUs = tUs,
+            statusVal = statusVal,
+            blockType = 0x05,            // QUAT
+            blockVal = quatVal
+        )
+        gattSeq++
+        sendQueue?.offer(quatFrame)
+    }
     // -------------------------
     // UF1 encode helpers
     // -------------------------
