@@ -409,6 +409,8 @@ class MainActivity : ComponentActivity() {
     // -------------------------
     // GATT connect + notify → UF1
     // -------------------------
+    // Current phone bridge is intentionally single-device.
+    // Multi-device support will need separate per-device GATT/session state.
     private fun startGattRaw(
         btAdapter: BluetoothAdapter,
         hostIp: String,
@@ -662,7 +664,12 @@ class MainActivity : ComponentActivity() {
             updateStatus("GATT: startScan exception: ${e.message}")
         }
     }
-
+    // Connected GATT payload mapping:
+    // 20/36/52 = raw-only packet family:
+    //            4-byte tSrc base + 1/2/3 raw EMG chunks (8 int16 samples per chunk)
+    // 26        = S2 aux packet: IMU + MAG + QUAT
+    // 60        = S1 packet: raw3 + QUAT
+    // other     = forwarded as unknown/debug block 0xF1
     private fun handleGattNotify(v: ByteArray, hostIp: String, port: Int, updateStatus: (String) -> Unit) {
         when (v.size) {
             20, 36, 52 -> {
@@ -787,6 +794,8 @@ class MainActivity : ComponentActivity() {
             updateStatus("GATT → $hostIp:$port notify≈${"%.1f".format(fps)} mac=$gattMac len=${v.size}")
         }
     }
+    // Split S2 aux payload into UF1 blocks:
+    // 0x03 = IMU, 0x04 = MAG, 0x05 = QUAT
     private fun handleAux26(v: ByteArray) {
         val imuVal = v.copyOfRange(0, 12)
         val magVal = v.copyOfRange(12, 18)
