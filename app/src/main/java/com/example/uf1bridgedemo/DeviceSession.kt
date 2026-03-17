@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.Build
+import android.util.Log
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -54,13 +55,14 @@ class DeviceSession(
 
     // ---- GATT lifecycle ----
     @Volatile private var gatt: BluetoothGatt? = null
-    @Volatile private var gattServicesStarted = false
-    @Volatile private var gattGotFirstData    = false
-    // Set to true in handleNameRead when name is resolved but first data hasn't arrived yet.
-    // Consumed (and cleared) in onCharacteristicChanged to send the name frame at the right moment.
-    @Volatile private var namePending         = false
+    @Volatile private var gattServicesStarted  = false
+    @Volatile private var gattGotFirstData     = false
+    // Set to true when enableTelemetry() is first called. Used by the name-read watchdog
+    // to detect whether the handshake is stuck waiting for onCharacteristicRead.
+    @Volatile private var telemetryStarted     = false
     // Name captured synchronously on the GATT thread — safe to read without posting to main thread.
-    // Distinct from deviceName (Compose state) which is updated asynchronously for the UI.
+    // Guaranteed non-null before first onCharacteristicChanged fires: handleNameRead sets it
+    // before calling enableTelemetry, and notifications only start after enableTelemetry completes.
     @Volatile private var resolvedName: String? = null
 
     // ---- Per-device UF1 sequencing ----
@@ -109,6 +111,28 @@ class DeviceSession(
         lastScanRssi = rssi
     }
 
+    /**
+     * Re-enqueue the 0x07 name frame into the shared send queue.
+     * Called by UmyoApp.startStreaming() for every connected session so the
+     * workbench always receives the name frame even if streaming was stopped
+     * and restarted after the initial namePending handshake completed.
+     * No-op if the name has not yet been resolved from firmware.
+     */
+    fun reEnqueueNameFrame(queue: ArrayBlockingQueue<ByteArray>) {
+        // Only resend for active sessions (first data already arrived and set resolvedName).
+        // Mid-handshake sessions (gattGotFirstData=false) will send the name frame themselves
+        // on their first onCharacteristicChanged.
+        if (!gattGotFirstData) {
+            Log.d("DeviceSession", "[$mac] reEnqueueNameFrame: skipped (session not yet active)")
+            return
+        }
+        val name = resolvedName
+        Log.d("DeviceSession", "[$mac] reEnqueueNameFrame: resolvedName=$name queueSize=${queue.size}")
+        if (name == null) return
+        val offered = queue.offer(uf1EncodeDeviceName(devId, nextSeq(), name))
+        Log.d("DeviceSession", "[$mac] reEnqueueNameFrame: offer=$offered queueSize=${queue.size}")
+    }
+
     /** Cleanly close the GATT connection. */
     fun disconnect() {
         mainHandler.post { status = Status.DISCONNECTED }
@@ -135,7 +159,7 @@ class DeviceSession(
 
                 gattServicesStarted = false
                 gattGotFirstData    = false
-                namePending         = false
+                telemetryStarted    = false
                 resolvedName        = null
                 mainHandler.post { status = Status.CONNECTED }
 
@@ -180,9 +204,29 @@ class DeviceSession(
 
             // Try to read device name before enabling telemetry
             val nameChar = svc.getCharacteristic(umyoNameCharUuid)
+            Log.d("DeviceSession", "[$mac] onServicesDiscovered: fbd02 char=${if (nameChar != null) "found" else "null"}")
             if (nameChar != null) {
-                g.readCharacteristic(nameChar)
-                // enableTelemetry() called from onCharacteristicRead after name arrives
+                val ok = g.readCharacteristic(nameChar)
+                Log.d("DeviceSession", "[$mac] readCharacteristic(fbd02)=$ok")
+                if (!ok) {
+                    // Stack refused the read — skip name, proceed without it
+                    Log.d("DeviceSession", "[$mac] readCharacteristic failed, enabling telemetry without name")
+                    enableTelemetry(g, svc, onLog)
+                } else {
+                    // Watchdog: if onCharacteristicRead never fires (stack swallowed the callback),
+                    // enableTelemetry will never be called and the device hangs forever.
+                    // After 5 s, fall through without the name rather than stay stuck.
+                    thread {
+                        Thread.sleep(5000)
+                        if (!telemetryStarted && status != Status.DISCONNECTED && gatt === g) {
+                            Log.d("DeviceSession", "[$mac] name-read watchdog fired — onCharacteristicRead never arrived, enabling telemetry without name")
+                            onLog("[$mac] name read timed out, proceeding without name")
+                            val svcRetry = g.getService(umyoServiceUuid)
+                            if (svcRetry != null) enableTelemetry(g, svcRetry, onLog)
+                        }
+                    }
+                }
+                // else (ok=true): enableTelemetry() called from onCharacteristicRead after name arrives
             } else {
                 enableTelemetry(g, svc, onLog)
             }
@@ -213,20 +257,20 @@ class DeviceSession(
 
         private fun handleNameRead(g: BluetoothGatt, uuid: UUID, value: ByteArray, st: Int) {
             if (uuid != umyoNameCharUuid) return
+            Log.d("DeviceSession", "[$mac] onCharacteristicRead fbd02: status=$st bytes=${value.size} raw=${value.toList()} instance=${System.identityHashCode(this@DeviceSession)}")
             if (st == BluetoothGatt.GATT_SUCCESS) {
-                val name = value.toString(Charsets.UTF_8).trim().takeIf { it.isNotEmpty() }
+                val name = value.toString(Charsets.UTF_8)
+                    .trim { it == '\u0000' || it.isWhitespace() }
+                    .takeIf { it.isNotEmpty() }
                 if (name != null) {
-                    resolvedName = name                     // sync capture for name frame encoding
-                    mainHandler.post { deviceName = name }  // async update for UI
-                    // If data already flowing, send name frame now; otherwise arm the flag so
-                    // onCharacteristicChanged sends it as soon as the first notification arrives.
-                    if (gattGotFirstData) {
-                        sendQueue.offer(uf1EncodeDeviceName(devId, nextSeq(), name))
-                    } else {
-                        namePending = true
-                    }
+                    resolvedName = name                     // sync — set before enableTelemetry
+                    mainHandler.post { deviceName = name }  // async — UI update
+                    Log.d("DeviceSession", "[$mac] resolvedName=\"$resolvedName\" instance=${System.identityHashCode(this@DeviceSession)}")
                 }
             }
+            // enableTelemetry is always called here, after resolvedName is set.
+            // Notifications cannot start until after this call completes (writeDescriptor → onDescriptorWrite),
+            // so resolvedName is guaranteed non-null before the first onCharacteristicChanged fires.
             val svc = g.getService(umyoServiceUuid)
             if (svc != null) enableTelemetry(g, svc, onLog)
         }
@@ -238,7 +282,6 @@ class DeviceSession(
         ) {
             if (st == BluetoothGatt.GATT_SUCCESS) {
                 gattGotFirstData = false
-                namePending      = false
                 onLog("[$mac] notifications enabled, waiting for data…")
                 thread {
                     Thread.sleep(2000)
@@ -260,12 +303,15 @@ class DeviceSession(
         ) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
                 val v = characteristic.value ?: return
+                val firstData = !gattGotFirstData
                 gattGotFirstData = true
-                if (!isStreaming()) return
-                if (namePending) {
-                    namePending = false
-                    sendQueue.offer(uf1EncodeDeviceName(devId, nextSeq(), resolvedName ?: mac))
+                Log.d("DeviceSession", "[$mac] onCharacteristicChanged API<33: firstData=$firstData isStreaming=${isStreaming()} instance=${System.identityHashCode(this@DeviceSession)}")
+                if (firstData) {
+                    val nameForFrame = resolvedName ?: mac
+                    val offered = sendQueue.offer(uf1EncodeDeviceName(devId, nextSeq(), nameForFrame))
+                    Log.d("DeviceSession", "[$mac] name frame: resolvedName=\"$nameForFrame\" offer=$offered")
                 }
+                if (!isStreaming()) return
                 mainHandler.post { status = Status.STREAMING }
                 handleGattNotify(v)
             }
@@ -277,12 +323,15 @@ class DeviceSession(
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray,
         ) {
+            val firstData = !gattGotFirstData
             gattGotFirstData = true
-            if (!isStreaming()) return
-            if (namePending) {
-                namePending = false
-                sendQueue.offer(uf1EncodeDeviceName(devId, nextSeq(), resolvedName ?: mac))
+            Log.d("DeviceSession", "[$mac] onCharacteristicChanged API33+: firstData=$firstData isStreaming=${isStreaming()} instance=${System.identityHashCode(this@DeviceSession)}")
+            if (firstData) {
+                val nameForFrame = resolvedName ?: mac
+                val offered = sendQueue.offer(uf1EncodeDeviceName(devId, nextSeq(), nameForFrame))
+                Log.d("DeviceSession", "[$mac] name frame: resolvedName=\"$nameForFrame\" offer=$offered")
             }
+            if (!isStreaming()) return
             mainHandler.post { status = Status.STREAMING }
             handleGattNotify(value)
         }
@@ -293,6 +342,7 @@ class DeviceSession(
     // ------------------------------------------------------------
 
     private fun enableTelemetry(g: BluetoothGatt, svc: BluetoothGattService, onLog: (String) -> Unit) {
+        telemetryStarted = true
         val ch = svc.getCharacteristic(umyoTelemCharUuid) ?: run {
             onLog("[$mac] telem characteristic not found")
             return

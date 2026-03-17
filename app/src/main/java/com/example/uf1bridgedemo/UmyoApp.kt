@@ -1,6 +1,7 @@
 package com.example.uf1bridgedemo
 
 import android.annotation.SuppressLint
+import android.util.Log
 import android.app.Application
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.le.ScanCallback
@@ -82,6 +83,13 @@ class UmyoApp : Application() {
                 catch (_: Exception) {}
             }
         }
+
+        // Re-enqueue the 0x07 name frame for every already-connected session.
+        // stopStreaming() clears the queue, so any name frame buffered before streaming
+        // started is gone. Each session re-sends its name so the workbench can label lanes.
+        Log.d("UmyoApp", "startStreaming: deviceList.size=${deviceList.size} queueSize=${sendQueue.size}")
+        deviceList.forEach { it.reEnqueueNameFrame(sendQueue) }
+        Log.d("UmyoApp", "startStreaming: reEnqueueNameFrame done queueSize=${sendQueue.size}")
     }
 
     fun stopStreaming() {
