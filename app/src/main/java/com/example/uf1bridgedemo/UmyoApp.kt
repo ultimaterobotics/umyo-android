@@ -146,8 +146,9 @@ class UmyoApp : Application() {
                 // Enforce device cap
                 if (deviceMap.size >= MAX_DEVICES) return
 
-                // Filter: must look like a uMyo
-                if (!looksLikeUmyo(result)) return
+                // Filter: advertised name must start with "uMyo-"
+                val advName = result.scanRecord?.deviceName ?: return
+                if (!advName.startsWith("uMyo-")) return
 
                 // Register and connect
                 val devId   = crc32U32(mac.toByteArray(Charsets.UTF_8))
@@ -155,8 +156,7 @@ class UmyoApp : Application() {
                 deviceMap[mac] = session
                 mainHandler.post { deviceList.add(session) }
 
-                val name = result.scanRecord?.deviceName?.takeIf { it.isNotEmpty() } ?: mac
-                onLog("Connecting to $name ($mac)…")
+                onLog("Connecting to $advName ($mac)…")
 
                 session.connect(
                     context     = applicationContext,
@@ -208,31 +208,4 @@ class UmyoApp : Application() {
         deviceMap.keys.toList().forEach { disconnectDevice(it) }
     }
 
-    // -----------------------------------------------------------------------
-    // uMyo heuristics (same as original single-device code)
-    // -----------------------------------------------------------------------
-
-    private fun looksLikeUmyo(result: ScanResult): Boolean {
-        val sr  = result.scanRecord ?: return false
-        val raw = sr.bytes ?: ByteArray(0)
-
-        val looksLikeNameInRaw = try {
-            String(raw, Charsets.ISO_8859_1).contains("uMyo", ignoreCase = true)
-        } catch (_: Exception) { false }
-
-        val mfg      = sr.manufacturerSpecificData
-        var hasMfg15 = false
-        if (mfg != null && mfg.size() > 0) {
-            for (i in 0 until mfg.size()) {
-                if (mfg.valueAt(i)?.size == 15) { hasMfg15 = true; break }
-            }
-        }
-
-        val mac = result.device?.address ?: ""
-        val looksLikeMacPattern =
-            mac.startsWith("D4:", ignoreCase = true) ||
-            mac.startsWith("D7:", ignoreCase = true)
-
-        return looksLikeNameInRaw || hasMfg15 || looksLikeMacPattern
-    }
 }
