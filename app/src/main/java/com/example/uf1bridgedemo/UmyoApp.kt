@@ -17,6 +17,7 @@ import androidx.compose.runtime.setValue
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.URLDecoder
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -146,9 +147,10 @@ class UmyoApp : Application() {
                 // Enforce device cap
                 if (deviceMap.size >= MAX_DEVICES) return
 
-                // Filter: advertised name must start with "uMyo-"
-                val advName = result.scanRecord?.deviceName ?: return
-                if (!advName.startsWith("uMyo-")) return
+                // Filter: advertised name must start with "uMyo, after decoding UTF"
+                val devName = result.scanRecord?.deviceName ?: return
+                val advName = URLDecoder.decode(devName, "UTF-8");
+                if (!advName.startsWith("uMyo")) return
 
                 // Register and connect
                 val devId   = crc32U32(mac.toByteArray(Charsets.UTF_8))
